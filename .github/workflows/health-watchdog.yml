@@ -1,0 +1,144 @@
+name: Health watchdog (external monitor)
+
+# Внешний мониторинг ketchunez.ru с инфраструктуры GitHub.
+# Не зависит от нашего сервера — если он упадёт, GitHub всё равно проверит и пришлёт алерт.
+#
+# Cron каждые 5 минут (минимальный интервал GitHub Actions).
+# Состояние "down/up" хранится между прогонами через actions/cache, чтобы не спамить
+# одинаковыми алертами и слать "восстановлен" при возврате в строй.
+#
+# Требуемые секреты (Settings → Secrets and variables → Actions):
+#   TELEGRAM_BOT_TOKEN — токен бота @Ketchunezsale_bot
+#   TELEGRAM_ALERT_CHAT_IDS — ID чатов через запятую (личка админов или ID группы)
+
+on:
+  # GitHub schedule events часто откладываются при нагрузке (особенно в начале часа).
+  # Делаем 3 смещённых расписания на нестандартных минутах + ручной триггер.
+  # Если одно расписание пропустится, другое сработает — в худшем случае пинг каждые ~4 мин.
+  schedule:
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 * * * *"
+    - cron: "1,11,21,31,41,51 * * * *"
+    - cron: "6,16,26,36,46,56 * * * *"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why running manually"
+        required: false
+        default: "manual"
+  # Внешние триггеры через repository_dispatch — позволяет cron-job.org / Pipedream
+  # тыкать нас извне когда захочешь добавить независимый источник.
+  repository_dispatch:
+    types: [healthcheck]
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: health-watchdog
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Restore previous state
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: health-state-${{ github.run_id }}
+          restore-keys: |
+            health-state-
+
+      - name: Ping site and send alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ALERT_CHAT_IDS: ${{ secrets.TELEGRAM_ALERT_CHAT_IDS }}
+          TELEGRAM_STATUS_THREAD_ID: ${{ secrets.TELEGRAM_STATUS_THREAD_ID }}
+        run: |
+          set +e
+          URL="https://ketchunez.ru/api/health"
+
+          # Состояние от прошлого прогона (если есть)
+          PREV="up"
+          PREV_FAILS=0
+          if [ -f state.json ]; then
+            PREV=$(jq -r '.state // "up"' state.json)
+            PREV_FAILS=$(jq -r '.consecutive_fails // 0' state.json)
+          fi
+
+          CODE=$(curl -s -o /tmp/body.txt -w "%{http_code}" --max-time 15 "$URL")
+          BODY=$(cat /tmp/body.txt 2>/dev/null | head -c 200)
+          DB_STATUS=$(echo "$BODY" | jq -r '.database // "?"' 2>/dev/null || echo "?")
+          echo "HTTP: $CODE | DB: $DB_STATUS"
+
+          if [ "$CODE" = "200" ] && [ "$DB_STATUS" = "ok" ]; then
+            NEW_STATE="up"
+            NEW_FAILS=0
+          else
+            NEW_STATE="down"
+            NEW_FAILS=$((PREV_FAILS + 1))
+          fi
+
+          send_alert() {
+            local TEXT="$1"
+            if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_ALERT_CHAT_IDS" ]; then
+              echo "WARN: TELEGRAM secrets not set, skipping alert"
+              return
+            fi
+            IFS=',' read -ra IDS <<< "$TELEGRAM_ALERT_CHAT_IDS"
+            for ID in "${IDS[@]}"; do
+              ID=$(echo "$ID" | xargs)
+              [ -z "$ID" ] && continue
+
+              # Group chat (ID начинается с минуса) → шлём в topic «Состояние сайта»
+              # Private DM (положительный user_id) → шлём напрямую без thread_id
+              local THREAD_PART=""
+              if [[ "$ID" == -* ]] && [ -n "$TELEGRAM_STATUS_THREAD_ID" ]; then
+                THREAD_PART=",\"message_thread_id\":${TELEGRAM_STATUS_THREAD_ID}"
+              fi
+
+              local PAYLOAD="{\"chat_id\":\"${ID}\",\"text\":$(jq -Rs . <<< "$TEXT"),\"disable_web_page_preview\":true${THREAD_PART}}"
+              local RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$PAYLOAD")
+              local OK=$(echo "$RESP" | jq -r '.ok // "fail"')
+              local ERR=$(echo "$RESP" | jq -r '.description // ""')
+              echo "  → chat_id=${ID} thread=${TELEGRAM_STATUS_THREAD_ID:-none}: ok=${OK} err=${ERR}"
+            done
+          }
+
+          # Триггеры (с защитой от спама через флаг alert_sent в state):
+          #   - DOWN алерт: один раз при достижении NEW_FAILS=2 (≥10 минут downtime)
+          #     и пока не получили UP — повторно не шлём
+          #   - UP алерт: переход down→up
+          PREV_ALERTED=$(jq -r '.alert_sent // "false"' state.json 2>/dev/null || echo "false")
+          NOW_UTC=$(date -u +'%Y-%m-%d %H:%M UTC')
+          NEW_ALERTED="$PREV_ALERTED"
+
+          if [ "$NEW_STATE" = "down" ] && [ "$NEW_FAILS" -ge 2 ] && [ "$PREV_ALERTED" != "true" ]; then
+            ALERT_DOWN=$(printf '🚨 Сайт ketchunez.ru недоступен\n\nHTTP: %s\nБД: %s\nПодряд фейлов: %s\nВремя: %s\n\nЭто внешний мониторинг GitHub — наш сервер недоступен, поэтому внутренний бот не может прислать алерт.' "$CODE" "$DB_STATUS" "$NEW_FAILS" "$NOW_UTC")
+            echo "Sending DOWN alert..."
+            send_alert "$ALERT_DOWN"
+            NEW_ALERTED="true"
+          fi
+          if [ "$NEW_STATE" = "up" ] && [ "$PREV" = "down" ]; then
+            ALERT_UP=$(printf '✅ Сайт ketchunez.ru восстановлен\n\nHTTP: %s\nБД: %s\nВремя: %s' "$CODE" "$DB_STATUS" "$NOW_UTC")
+            echo "Sending UP alert..."
+            send_alert "$ALERT_UP"
+            NEW_ALERTED="false"
+          fi
+
+          # Сохраняем состояние (плюс флаг alert_sent — не спамим повторно)
+          jq -n --arg s "$NEW_STATE" --argjson f "$NEW_FAILS" --arg a "$NEW_ALERTED" \
+            '{state: $s, consecutive_fails: $f, alert_sent: ($a == "true"), ts: now}' > state.json
+          cat state.json
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: health-state-${{ github.run_id }}
