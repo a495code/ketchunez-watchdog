@@ -70,11 +70,14 @@ jobs:
           fi
 
           CODE=$(curl -s -o /tmp/body.txt -w "%{http_code}" --max-time 15 "$URL")
-          BODY=$(cat /tmp/body.txt 2>/dev/null | head -c 200)
+          BODY=$(cat /tmp/body.txt 2>/dev/null | head -c 300)
+          # /api/health возвращает {"status":"ok","database":"connected",...}.
+          # «здоровый» = HTTP 200 + .status == "ok" (общий статус сайта).
+          STATUS_FIELD=$(echo "$BODY" | jq -r '.status // "?"' 2>/dev/null || echo "?")
           DB_STATUS=$(echo "$BODY" | jq -r '.database // "?"' 2>/dev/null || echo "?")
-          echo "HTTP: $CODE | DB: $DB_STATUS"
+          echo "HTTP: $CODE | status: $STATUS_FIELD | database: $DB_STATUS"
 
-          if [ "$CODE" = "200" ] && [ "$DB_STATUS" = "ok" ]; then
+          if [ "$CODE" = "200" ] && [ "$STATUS_FIELD" = "ok" ]; then
             NEW_STATE="up"
             NEW_FAILS=0
           else
